@@ -232,7 +232,7 @@ local FUNCMACRO = STARTL.."("..IDENTIFIER..")%(([_%s%w,]*)%)%s*(.*)"
 -- ------------
 lcpp.STATE = {lineno = 0} -- current state for debugging the last operation
 local function error(msg) _G.print(debug.traceback()); _G.error(string.format("lcpp ERR [%04i] %s", lcpp.STATE.lineno, msg)) end
-local function print(msg) _G.print(string.format("lcpp INF [%04i] %s", lcpp.STATE.lineno, msg)) end
+local function print(...) _G.print(string.format("lcpp INF [%04i] %s", lcpp.STATE.lineno, table.concat({...}, ' '))) end
 
 -- splits a string using a pattern into a table of substrings
 local function gsplit(str, pat)
@@ -593,7 +593,7 @@ local function apply(state, input)
 end
 
 -- processes an input line. called from lcpp doWork loop
-local function processLine(state, line)
+local function processLine(state, line, inc_levels)
 	if not line or #line == 0 then return line end
 	local cmd = nil 
 	if line:byte(1) == CMD_BYTE then cmd = line:sub(2) end
@@ -674,16 +674,17 @@ local function processLine(state, line)
 		-- handle #include ...
 		local filename = cmd:match(INCLUDE)
 		if filename then
-			return state:includeFile(filename, true)
+			return state:includeFile(filename, true, nil, nil, inc_levels)
 		end
 		local filename = cmd:match(LOCAL_INCLUDE)
 		if filename then
-			return state:includeFile(filename, false, false, true)
+			return state:includeFile(filename, false, false, true, inc_levels)
 		end
 		local filename = cmd:match(INCLUDE_NEXT)
 		if filename then
 		--print("include_next:"..filename)
-			return state:includeFile(filename, true, true)
+			inc_levels[filename] = inc_levels[filename] + 1
+			return state:includeFile(filename, true, true, nil, inc_levels)
 		end
 		
 		-- ignore, because we dont have any pragma directives yet
@@ -725,14 +726,15 @@ local function processLine(state, line)
 	return line
 end
 
-local function doWork(state)
+local function doWork(state, levels)
 	local function _doWork(state)	
 		if not state:defined(__FILE__) then state:define(__FILE__, "<USER_CHUNK>", true) end
 		local oldIndent = state:getIndent()
+		local inclevels = levels or setmetatable({}, {__index = function() return 0 end})
 		while true do
 			local input = state:getLine()
 			if not input then break end
-			local output = processLine(state, input)
+			local output = processLine(state, input, inclevels)
 			if not lcpp.FAST and not output then output = "" end -- output empty skipped lines
 			if lcpp.DEBUG then output = output.." -- "..input end -- input as comment when DEBUG
 			if output then coroutine.yield(output) end
@@ -742,12 +744,16 @@ local function doWork(state)
 	return coroutine.wrap(function() _doWork(state) end)
 end
 
-local function includeFile(state, filename, system, next, _local)
-	local result, result_state = lcpp.compileFile(filename, state.defines, system, state.macro_sources, next, _local)
-	-- now, we take the define table of the sub file for further processing
-	state.defines = result_state.defines
-	-- and return the compiled result	
-	return result
+local function includeFile(state, filename, system, next, _local, levels)
+	if not state.included[filename] then
+		local result, result_state = lcpp.compileFile(filename, state.defines, system, state.macro_sources, next, _local, levels)
+		-- now, we take the define table of the sub file for further processing
+		state.defines = result_state.defines
+		-- register, that lirary is included
+		state.included[filename] = true
+		-- and return the compiled result
+		return result
+	end
 end
 
 -- sets a global define
@@ -1268,7 +1274,7 @@ local function parseFunction(state, input)
 		
 	-- build macro funcion
 	local func = function(input)
-		return input:gsub(name.."%s*(%b())", function (match)
+		return tostring(input):gsub(name.."%s*(%b())", function (match)
 			return replaceArgs(match, repl)
 		end)
 	end
@@ -1285,6 +1291,7 @@ end
 function lcpp.init(input, predefines, macro_sources)
 	-- create sate var
 	local state     = {}              -- init the state object
+	state.included =  {}              -- the table of included libraries
 	state.defines   = {}              -- the table of known defines and replacements
 	state.screener  = screener(input)
 	state.lineno    = 0               -- the current line number
@@ -1361,15 +1368,38 @@ end
 -- @param predefines OPTIONAL a table of predefined variables
 -- @usage lcpp.compile("#define bar 0x1337\nstatic const int foo = bar;")
 -- @usage lcpp.compile("#define bar 0x1337\nstatic const int foo = bar;", {["bar"] = "0x1338"})
-function lcpp.compile(code, predefines, macro_sources)
+function lcpp.compile(code, predefines, macro_sources, levels)
 	local state = lcpp.init(code, predefines, macro_sources)
 	local buf = {}
-	for output in state:doWork() do
-		table.insert(buf, output)
+	for output in state:doWork(levels) do
+		if output ~= nil and output ~= '' then
+			table.insert(buf, output)
+		end
 	end
 	local output = table.concat(buf, NEWL)
 	if lcpp.DEBUG then print(output) end
 	return output, state
+end
+
+local function findfile(filename,levels)
+	local level, file
+	if levels then
+		level = levels[filename]
+	else
+		level = 0
+	end
+	local fileseparator = string.sub(package.config,1,1)
+	for path in lcpp.PATH:gmatch('%f[^\0^;](.-)%f[\0;]') do
+		file = io.open(path..fileseparator..filename)
+		if file then
+			if level == 0 then
+				break
+			else
+				level = level -1
+			end
+		end
+	end
+	return file
 end
 
 --- preprocesses a file
@@ -1377,17 +1407,20 @@ end
 -- @param predefines OPTIONAL a table of predefined variables
 -- @param system OPTIONAL search file in current directory or in lcpp.PATH
 -- @usage out, state = lcpp.compileFile("../odbg/plugin.h", {["MAX_PAH"]=260, ["UNICODE"]=true}, false)
-function lcpp.compileFile(filename, predefines, system, macro_sources, next, _local)
+function lcpp.compileFile(filename, predefines, system, macro_sources, next, _local, levels)
 	if type(filename) ~= 'string' then error("processFile() arg1 has to be a string") end
+--	local level = level or 0
 	local file
 	if system then
-		local fileseparator = string.sub(package.config,1,1)
-		for path in lcpp.PATH:gmatch('%f[^\0^;](.-)%f[\0;]') do
-			file = io.open(path..fileseparator..filename)
-			if file then break end
-		end
+		file = findfile(filename, levels)
 	else
 		file = io.open(filename, 'r')
+		if not file then
+			file = findfile(filename, levels)
+			if file then
+				print('warning: using system lib '..filename..' included with non-system syntax')
+			end
+		end
 	end
 	if not file then
 		error("file not found (system: "..tostring(system or false).."): "..filename)
@@ -1396,7 +1429,7 @@ function lcpp.compileFile(filename, predefines, system, macro_sources, next, _lo
 	file:close()
 	predefines = predefines or {}
 	predefines[__FILE__] = filename
-	return lcpp.compile(code, predefines, macro_sources)
+	return lcpp.compile(code, predefines, macro_sources, levels)
 end
 
 
