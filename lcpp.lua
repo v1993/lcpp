@@ -736,10 +736,10 @@ local function doWork(state, levels)
 			if not input then break end
 			local output = processLine(state, input, inclevels)
 			if not lcpp.FAST and not output then output = "" end -- output empty skipped lines
-			if lcpp.DEBUG then output = output.." -- "..input end -- input as comment when DEBUG
+--			if lcpp.DEBUG then output = output.." -- "..input end -- input as comment when DEBUG
 			if output then coroutine.yield(output) end
 		end
-		if (oldIndent ~= state:getIndent()) then error("indentation level must be balanced within a file. was:"..oldIndent.." is:"..state:getIndent()) end
+--		if (oldIndent ~= state:getIndent()) then error("indentation level must be balanced within a file. was:"..oldIndent.." is:"..state:getIndent()) end
 	end
 	return coroutine.wrap(function() _doWork(state) end)
 end
@@ -1377,7 +1377,7 @@ function lcpp.compile(code, predefines, macro_sources, levels)
 		end
 	end
 	local output = table.concat(buf, NEWL)
-	if lcpp.DEBUG then print(output) end
+--	if lcpp.DEBUG then print(output) end
 	return output, state
 end
 
@@ -1409,7 +1409,7 @@ end
 -- @usage out, state = lcpp.compileFile("../odbg/plugin.h", {["MAX_PAH"]=260, ["UNICODE"]=true}, false)
 function lcpp.compileFile(filename, predefines, system, macro_sources, next, _local, levels)
 	if type(filename) ~= 'string' then error("processFile() arg1 has to be a string") end
---	local level = level or 0
+	if lcpp.DEBUG then print('Loading file', filename) end
 	local file
 	if system then
 		file = findfile(filename, levels)
@@ -1418,7 +1418,7 @@ function lcpp.compileFile(filename, predefines, system, macro_sources, next, _lo
 		if not file then
 			file = findfile(filename, levels)
 			if file then
-				print('warning: using system lib '..filename..' included with non-system syntax')
+				print('warning: using system library '..filename..' included with non-system syntax')
 			end
 		end
 	end
@@ -1927,7 +1927,6 @@ function lcpp.test(suppressMsg)
 	lcpp.SELF_TEST = true
 	local testlua = lcpp.compile(testlcpp)
 	lcpp.SELF_TEST = nil
-	-- 	print(testlua)
 	assert(loadstring(testlua, "testlua"))()
 	lcpp_test.assertTrueCalls = findn(testlcpp, "lcpp_test.assertTrue()")
 	assert(lcpp_test.assertTrueCount == lcpp_test.assertTrueCalls, "assertTrue calls:"..lcpp_test.assertTrueCalls.." count:"..lcpp_test.assertTrueCount)
@@ -1982,7 +1981,16 @@ lcpp.enable = function()
 			ffi.lcpp_cdef_backup = ffi.cdef
 			ffi.cdef = function(input) 
 				if true then
-					return ffi.lcpp_cdef_backup(ffi.lcpp(input)) 
+					local str = ffi.lcpp(input)
+					while true do
+						local num
+						str,num = str:gsub('extern%s-%b""%s-(%b{})', function(str) return str:sub(2,-2) end)
+						if num == 0 then
+							break
+						end
+					end
+					str = str:gsub('extern%s-%b""%s+', ''):gsub('[tT][hH][rR][oO][wW]%s-%(.-%).-;', '')
+					return ffi.lcpp_cdef_backup(str) 
 				else
 					local fn,cnt = input:gsub('#include ["<].-([^/]+%.h)[">]', '%1')
 					input = ffi.lcpp(input)
